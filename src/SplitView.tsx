@@ -254,7 +254,13 @@ export default function SplitView({
               {rows.map((row) => (
                 <tr key={row.id} className={row.status === 'error' ? 'row-error' : ''}>
                   <td className="cell-filename">
-                    {row.pageStart === row.pageEnd ? `Page ${row.pageStart}` : `Pages ${row.pageStart}–${row.pageEnd}`}
+                    {(row.sourcePageRanges ?? [{ pageStart: row.pageStart, pageEnd: row.pageEnd }])
+                      .map((range) =>
+                        range.pageStart === range.pageEnd
+                          ? `Page ${range.pageStart}`
+                          : `Pages ${range.pageStart}–${range.pageEnd}`
+                      )
+                      .join(', ')}
                   </td>
                   <td>
                     <input
@@ -304,9 +310,9 @@ export default function SplitView({
 
       {rows.length === 0 && !processing && (
         <p className="empty-hint">
-          Upload one merged PDF containing multiple students' letters back-to-back. Student boundaries are detected by
-          Student ID and each student is exported as one PDF. Consecutive pages carrying the same ID stay together, so a
-          translated PNL can remain bundled with the student's English PNL.
+          Upload one merged PDF containing multiple students' letters. The tool splits the batch into normal document
+          units, detects each Student ID, and combines matching IDs into one student PDF — including translated PNLs that
+          appear later in the batch after the English PNLs.
         </p>
       )}
 
