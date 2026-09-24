@@ -30,6 +30,7 @@ export interface SplitRow {
   id: string;
   pageStart: number; // 1-indexed, inclusive
   pageEnd: number; // 1-indexed, inclusive
+  sourcePageRanges?: Array<{ pageStart: number; pageEnd: number }>; // supports non-contiguous English + translated units
   studentId: string;
   newFilename: string;
   method: DetectionMethod;
