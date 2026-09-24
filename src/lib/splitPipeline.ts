@@ -15,6 +15,18 @@ export interface SplitBatchResult {
   oddPageCountWarning: boolean;
 }
 
+type PageDetection = {
+  studentId: string;
+  method: DetectionMethod;
+  confidence: number;
+  candidates?: unknown[];
+};
+
+type PageRange = {
+  pageStart: number;
+  pageEnd: number;
+};
+
 function cropTop(src: HTMLCanvasElement, frac: number): HTMLCanvasElement {
   const sh = src.height * frac;
   const out = document.createElement('canvas');
@@ -31,9 +43,9 @@ function cropTop(src: HTMLCanvasElement, frac: number): HTMLCanvasElement {
  * substantial embedded text in its upper (header) region -- see
  * pipeline.ts for why.
  */
-async function detectOnPage(doc: any, pageNumber: number) {
+async function detectOnPage(doc: any, pageNumber: number): Promise<PageDetection> {
   const { items, pageWidth, pageHeight } = await extractPageText(doc, pageNumber);
-  let detection = detectStudentId(items, pageWidth);
+  let detection = detectStudentId(items, pageWidth) as PageDetection;
 
   const headerItems = items.filter((it: any) => it.top < pageHeight * 0.35);
   const headerChars = headerItems.reduce((s: number, it: any) => s + it.str.replace(/\s/g, '').length, 0);
@@ -45,24 +57,79 @@ async function detectOnPage(doc: any, pageNumber: number) {
       let ocr = await ocrStudentId(cropped);
       if (!ocr.studentId) ocr = await ocrStudentId(canvas);
       if (ocr.studentId) {
-        detection = { studentId: ocr.studentId, method: 'ocr' as any, confidence: ocr.confidence, candidates: [] };
+        detection = {
+          studentId: ocr.studentId,
+          method: 'ocr',
+          confidence: ocr.confidence,
+          candidates: [],
+        };
       }
     } catch {
       // fall through with whatever `detection` already holds
     }
   }
+
   return detection;
 }
 
 /**
- * Split one merged PDF into fixed-size (default 2-page) student units.
+ * Build student page ranges from Student-ID anchors instead of blindly
+ * chopping the batch into fixed-size chunks.
  *
- * Detection runs on every page of each unit (not just the first), and if
- * two pages in the same unit disagree on a high-confidence Student ID,
- * that's treated as a signal the fixed-page-count assumption broke for
- * this unit (an extra/missing page, a misordered batch, etc.) -- the unit
- * is flagged for manual review rather than silently split under a
- * possibly-wrong name.
+ * The profile's pagesPerStudent remains the minimum/normal unit size.
+ * Once that many pages have accumulated, a DIFFERENT Student ID starts a
+ * new student. Repeating the SAME Student ID later keeps the pages
+ * together, which is what lets a standard 2-page PNL plus its adjacent
+ * 2-page translation become one 4-page output PDF.
+ *
+ * If the first expected unit has no detectable ID and a later page does,
+ * the anonymous minimum-size unit is closed before the detected ID. This
+ * is intentionally conservative: it is safer to surface an unknown
+ * 2-page PNL for review than to silently merge it into the next student.
+ */
+function buildStudentRanges(detections: PageDetection[], pagesPerStudent: number): PageRange[] {
+  if (detections.length === 0) return [];
+
+  const ranges: PageRange[] = [];
+  let pageStart = 1;
+  let currentStudentId = detections[0]?.studentId || '';
+
+  for (let page = 2; page <= detections.length; page++) {
+    const detectedId = detections[page - 1]?.studentId || '';
+    if (!detectedId) continue;
+
+    const pagesAlreadyInRange = page - pageStart;
+
+    if (!currentStudentId) {
+      if (pagesAlreadyInRange >= pagesPerStudent) {
+        ranges.push({ pageStart, pageEnd: page - 1 });
+        pageStart = page;
+      }
+      currentStudentId = detectedId;
+      continue;
+    }
+
+    if (detectedId !== currentStudentId && pagesAlreadyInRange >= pagesPerStudent) {
+      ranges.push({ pageStart, pageEnd: page - 1 });
+      pageStart = page;
+      currentStudentId = detectedId;
+    }
+    // Same ID = same student, so intentionally keep collecting pages.
+    // A different ID inside the minimum expected unit is retained in the
+    // same range and will be surfaced below as a disagreement warning.
+  }
+
+  ranges.push({ pageStart, pageEnd: detections.length });
+  return ranges;
+}
+
+/**
+ * Split one merged PDF into Student-ID-aware units.
+ *
+ * PNLs normally span 2 pages, but translated PNLs can appear immediately
+ * after the English PNL with the same Student ID. Because boundaries are
+ * based on ID changes after the normal minimum unit size, 2-page and
+ * 4-page PNLs can safely coexist in the same merged batch.
  */
 export async function splitBatchPdf(file: File, profile: DocumentProfile): Promise<SplitBatchResult> {
   const pagesPerStudent = profile.pagesPerStudent;
@@ -101,24 +168,23 @@ export async function splitBatchPdf(file: File, profile: DocumentProfile): Promi
   const totalPages = loaded.numPages;
   const oddPageCountWarning = totalPages % pagesPerStudent !== 0;
 
+  // Detect once per page first. Those detections determine student
+  // boundaries and are then reused when each output row is evaluated.
+  const pageDetections: PageDetection[] = [];
+  for (let page = 1; page <= totalPages; page++) {
+    pageDetections.push(await detectOnPage(loaded.doc, page));
+  }
+
+  const ranges = buildStudentRanges(pageDetections, pagesPerStudent);
+
   // Keep the original bytes around so pdf-lib can copy pages without
   // re-fetching or re-parsing from scratch for every unit.
   const srcDocForCopy = await PDFDocument.load(bytes.slice(0));
 
   const rows: SplitRow[] = [];
-  let pageStart = 1;
 
-  // eslint-disable-next-line no-constant-condition
-  while (pageStart <= totalPages) {
-    const pageEnd = Math.min(pageStart + pagesPerStudent - 1, totalPages);
-    const isFullUnit = pageEnd - pageStart + 1 === pagesPerStudent;
-
-    // Detect on every page in the unit.
-    const detections = [];
-    for (let p = pageStart; p <= pageEnd; p++) {
-      detections.push(await detectOnPage(loaded.doc, p));
-    }
-
+  for (const { pageStart, pageEnd } of ranges) {
+    const detections = pageDetections.slice(pageStart - 1, pageEnd);
     const withId = detections.filter((d) => d.studentId);
     const distinctIds = [...new Set(withId.map((d) => d.studentId))];
 
@@ -131,28 +197,42 @@ export async function splitBatchPdf(file: File, profile: DocumentProfile): Promi
     if (distinctIds.length === 1) {
       const best = withId.reduce((a, b) => (b.confidence > a.confidence ? b : a));
       studentId = best.studentId;
-      method = best.method as DetectionMethod;
+      method = best.method;
       confidence = best.confidence;
     } else if (distinctIds.length > 1) {
-      // pages disagree -- don't guess, surface both for manual resolution
       const best = withId.reduce((a, b) => (b.confidence > a.confidence ? b : a));
       studentId = best.studentId;
-      method = best.method as DetectionMethod;
+      method = best.method;
       confidence = Math.min(best.confidence, 0.4);
       warning = `Pages ${pageStart}-${pageEnd} show different Student IDs (${distinctIds.join(', ')}) -- please confirm.`;
       pagesDisagree = true;
     }
 
-    if (!isFullUnit) {
+    const pageCount = pageEnd - pageStart + 1;
+
+    if (pageCount < pagesPerStudent) {
       warning = warning
-        ? `${warning} Also: only ${pageEnd - pageStart + 1} page(s) remained, expected ${pagesPerStudent}.`
-        : `Only ${pageEnd - pageStart + 1} page(s) remained here, expected ${pagesPerStudent} -- batch page count may be off.`;
+        ? `${warning} Also: only ${pageCount} page(s) remained, expected at least ${pagesPerStudent}.`
+        : `Only ${pageCount} page(s) remained here, expected at least ${pagesPerStudent} -- batch page count may be off.`;
     }
 
-    // Build the split-out PDF bytes for this unit.
+    // A longer-than-normal unit is accepted automatically only when the
+    // same Student ID is actually seen again later in that range. That is
+    // the positive signal expected for an adjacent translated PNL. If a
+    // boundary ID was simply missed, this safeguard prevents several
+    // pages from being silently merged under one student's name.
+    if (pageCount > pagesPerStudent && distinctIds.length === 1) {
+      const matchingAnchors = withId.filter((d) => d.studentId === studentId).length;
+      if (matchingAnchors < 2) {
+        warning = warning
+          ? `${warning} Also: ${pageCount} pages were grouped for this student, but the Student ID was detected only once.`
+          : `${pageCount} pages were grouped for this student, but the Student ID was detected only once -- review for a missed student boundary.`;
+      }
+    }
+
     const outDoc = await PDFDocument.create();
     const pageIndices = [];
-    for (let p = pageStart; p <= pageEnd; p++) pageIndices.push(p - 1);
+    for (let page = pageStart; page <= pageEnd; page++) pageIndices.push(page - 1);
     const copied = await outDoc.copyPages(srcDocForCopy, pageIndices);
     copied.forEach((pg) => outDoc.addPage(pg));
     const pdfBytes = await outDoc.save();
@@ -176,8 +256,6 @@ export async function splitBatchPdf(file: File, profile: DocumentProfile): Promi
       pagesDisagree,
       pdfBytes: pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength) as ArrayBuffer,
     });
-
-    pageStart = pageEnd + 1;
   }
 
   return { rows, totalPages, pagesPerStudent, oddPageCountWarning };
