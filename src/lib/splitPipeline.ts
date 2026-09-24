@@ -22,9 +22,14 @@ type PageDetection = {
   candidates?: unknown[];
 };
 
-type PageRange = {
+type Unit = {
   pageStart: number;
   pageEnd: number;
+  studentId: string;
+  method: DetectionMethod;
+  confidence: number;
+  warning?: string;
+  pagesDisagree: boolean;
 };
 
 function cropTop(src: HTMLCanvasElement, frac: number): HTMLCanvasElement {
@@ -37,12 +42,6 @@ function cropTop(src: HTMLCanvasElement, frac: number): HTMLCanvasElement {
   return out;
 }
 
-/**
- * Mirrors the per-file pipeline's logic, just scoped to one page instead
- * of "page 1 of this file". Skips OCR when the page already has
- * substantial embedded text in its upper (header) region -- see
- * pipeline.ts for why.
- */
 async function detectOnPage(doc: any, pageNumber: number): Promise<PageDetection> {
   const { items, pageWidth, pageHeight } = await extractPageText(doc, pageNumber);
   let detection = detectStudentId(items, pageWidth) as PageDetection;
@@ -65,71 +64,60 @@ async function detectOnPage(doc: any, pageNumber: number): Promise<PageDetection
         };
       }
     } catch {
-      // fall through with whatever `detection` already holds
+      // fall through with whatever detection already holds
     }
   }
 
   return detection;
 }
 
-/**
- * Build student page ranges from Student-ID anchors instead of blindly
- * chopping the batch into fixed-size chunks.
- *
- * The profile's pagesPerStudent remains the minimum/normal unit size.
- * Once that many pages have accumulated, a DIFFERENT Student ID starts a
- * new student. Repeating the SAME Student ID later keeps the pages
- * together, which is what lets a standard 2-page PNL plus its adjacent
- * 2-page translation become one 4-page output PDF.
- *
- * If the first expected unit has no detectable ID and a later page does,
- * the anonymous minimum-size unit is closed before the detected ID. This
- * is intentionally conservative: it is safer to surface an unknown
- * 2-page PNL for review than to silently merge it into the next student.
- */
-function buildStudentRanges(detections: PageDetection[], pagesPerStudent: number): PageRange[] {
-  if (detections.length === 0) return [];
+function summarizeUnit(
+  pageStart: number,
+  pageEnd: number,
+  detections: PageDetection[],
+  expectedPages: number
+): Unit {
+  const withId = detections.filter((d) => d.studentId);
+  const distinctIds = [...new Set(withId.map((d) => d.studentId))];
 
-  const ranges: PageRange[] = [];
-  let pageStart = 1;
-  let currentStudentId = detections[0]?.studentId || '';
+  let studentId = '';
+  let method: DetectionMethod = 'none';
+  let confidence = 0;
+  let warning: string | undefined;
+  let pagesDisagree = false;
 
-  for (let page = 2; page <= detections.length; page++) {
-    const detectedId = detections[page - 1]?.studentId || '';
-    if (!detectedId) continue;
-
-    const pagesAlreadyInRange = page - pageStart;
-
-    if (!currentStudentId) {
-      if (pagesAlreadyInRange >= pagesPerStudent) {
-        ranges.push({ pageStart, pageEnd: page - 1 });
-        pageStart = page;
-      }
-      currentStudentId = detectedId;
-      continue;
-    }
-
-    if (detectedId !== currentStudentId && pagesAlreadyInRange >= pagesPerStudent) {
-      ranges.push({ pageStart, pageEnd: page - 1 });
-      pageStart = page;
-      currentStudentId = detectedId;
-    }
-    // Same ID = same student, so intentionally keep collecting pages.
-    // A different ID inside the minimum expected unit is retained in the
-    // same range and will be surfaced below as a disagreement warning.
+  if (distinctIds.length === 1) {
+    const best = withId.reduce((a, b) => (b.confidence > a.confidence ? b : a));
+    studentId = best.studentId;
+    method = best.method;
+    confidence = best.confidence;
+  } else if (distinctIds.length > 1) {
+    const best = withId.reduce((a, b) => (b.confidence > a.confidence ? b : a));
+    studentId = best.studentId;
+    method = best.method;
+    confidence = Math.min(best.confidence, 0.4);
+    warning = `Pages ${pageStart}-${pageEnd} show different Student IDs (${distinctIds.join(', ')}) -- please confirm.`;
+    pagesDisagree = true;
   }
 
-  ranges.push({ pageStart, pageEnd: detections.length });
-  return ranges;
+  const pageCount = pageEnd - pageStart + 1;
+  if (pageCount < expectedPages) {
+    warning = warning
+      ? `${warning} Also: only ${pageCount} page(s) remained, expected ${expectedPages}.`
+      : `Only ${pageCount} page(s) remained here, expected ${expectedPages} -- batch page count may be off.`;
+  }
+
+  return { pageStart, pageEnd, studentId, method, confidence, warning, pagesDisagree };
 }
 
 /**
- * Split one merged PDF into Student-ID-aware units.
+ * The exported batch is ordered as:
+ *   English PNL for every student, then translated PNLs for students who need them.
  *
- * PNLs normally span 2 pages, but translated PNLs can appear immediately
- * after the English PNL with the same Student ID. Because boundaries are
- * based on ID changes after the normal minimum unit size, 2-page and
- * 4-page PNLs can safely coexist in the same merged batch.
+ * Therefore we first split the source into normal fixed-size PNL units
+ * (2 pages for PNL), detect the Student ID for each unit, and only then
+ * combine units with the same Student ID even when they are far apart in
+ * the source PDF. This preserves English first, translation second.
  */
 export async function splitBatchPdf(file: File, profile: DocumentProfile): Promise<SplitBatchResult> {
   const pagesPerStudent = profile.pagesPerStudent;
@@ -146,19 +134,18 @@ export async function splitBatchPdf(file: File, profile: DocumentProfile): Promi
         ? 'Corrupted or unreadable PDF'
         : 'Failed to open PDF';
     return {
-      rows: [
-        {
-          id: crypto.randomUUID(),
-          pageStart: 1,
-          pageEnd: 1,
-          studentId: '',
-          newFilename: '',
-          method: 'none',
-          confidence: 0,
-          status: 'error',
-          warning: msg,
-        },
-      ],
+      rows: [{
+        id: crypto.randomUUID(),
+        pageStart: 1,
+        pageEnd: 1,
+        sourcePageRanges: [{ pageStart: 1, pageEnd: 1 }],
+        studentId: '',
+        newFilename: '',
+        method: 'none',
+        confidence: 0,
+        status: 'error',
+        warning: msg,
+      }],
       totalPages: 0,
       pagesPerStudent,
       oddPageCountWarning: false,
@@ -167,86 +154,74 @@ export async function splitBatchPdf(file: File, profile: DocumentProfile): Promi
 
   const totalPages = loaded.numPages;
   const oddPageCountWarning = totalPages % pagesPerStudent !== 0;
+  const srcDocForCopy = await PDFDocument.load(bytes.slice(0));
 
-  // Detect once per page first. Those detections determine student
-  // boundaries and are then reused when each output row is evaluated.
-  const pageDetections: PageDetection[] = [];
-  for (let page = 1; page <= totalPages; page++) {
-    pageDetections.push(await detectOnPage(loaded.doc, page));
+  // Step 1: preserve the known document structure. Each PNL is a normal
+  // fixed-size unit; translations are separate units later in the batch.
+  const units: Unit[] = [];
+  for (let pageStart = 1; pageStart <= totalPages; pageStart += pagesPerStudent) {
+    const pageEnd = Math.min(pageStart + pagesPerStudent - 1, totalPages);
+    const detections: PageDetection[] = [];
+    for (let page = pageStart; page <= pageEnd; page++) {
+      detections.push(await detectOnPage(loaded.doc, page));
+    }
+    units.push(summarizeUnit(pageStart, pageEnd, detections, pagesPerStudent));
   }
 
-  const ranges = buildStudentRanges(pageDetections, pagesPerStudent);
+  // Step 2: group only cleanly identified units by Student ID, regardless
+  // of where they occur in the batch. Ambiguous/no-ID units remain
+  // separate so we never merge uncertain documents into the wrong student.
+  const grouped: Array<{ key: string; units: Unit[] }> = [];
+  const groupIndex = new Map<string, number>();
 
-  // Keep the original bytes around so pdf-lib can copy pages without
-  // re-fetching or re-parsing from scratch for every unit.
-  const srcDocForCopy = await PDFDocument.load(bytes.slice(0));
+  for (const unit of units) {
+    const canGroup = !!unit.studentId && !unit.pagesDisagree && !unit.warning;
+    const key = canGroup ? `student:${unit.studentId}` : `unit:${unit.pageStart}`;
+
+    if (canGroup && groupIndex.has(key)) {
+      grouped[groupIndex.get(key)!].units.push(unit);
+    } else {
+      groupIndex.set(key, grouped.length);
+      grouped.push({ key, units: [unit] });
+    }
+  }
 
   const rows: SplitRow[] = [];
 
-  for (const { pageStart, pageEnd } of ranges) {
-    const detections = pageDetections.slice(pageStart - 1, pageEnd);
-    const withId = detections.filter((d) => d.studentId);
-    const distinctIds = [...new Set(withId.map((d) => d.studentId))];
-
-    let studentId = '';
-    let method: DetectionMethod = 'none';
-    let confidence = 0;
-    let warning: string | undefined;
-    let pagesDisagree = false;
-
-    if (distinctIds.length === 1) {
-      const best = withId.reduce((a, b) => (b.confidence > a.confidence ? b : a));
-      studentId = best.studentId;
-      method = best.method;
-      confidence = best.confidence;
-    } else if (distinctIds.length > 1) {
-      const best = withId.reduce((a, b) => (b.confidence > a.confidence ? b : a));
-      studentId = best.studentId;
-      method = best.method;
-      confidence = Math.min(best.confidence, 0.4);
-      warning = `Pages ${pageStart}-${pageEnd} show different Student IDs (${distinctIds.join(', ')}) -- please confirm.`;
-      pagesDisagree = true;
-    }
-
-    const pageCount = pageEnd - pageStart + 1;
-
-    if (pageCount < pagesPerStudent) {
-      warning = warning
-        ? `${warning} Also: only ${pageCount} page(s) remained, expected at least ${pagesPerStudent}.`
-        : `Only ${pageCount} page(s) remained here, expected at least ${pagesPerStudent} -- batch page count may be off.`;
-    }
-
-    // A longer-than-normal unit is accepted automatically only when the
-    // same Student ID is actually seen again later in that range. That is
-    // the positive signal expected for an adjacent translated PNL. If a
-    // boundary ID was simply missed, this safeguard prevents several
-    // pages from being silently merged under one student's name.
-    if (pageCount > pagesPerStudent && distinctIds.length === 1) {
-      const matchingAnchors = withId.filter((d) => d.studentId === studentId).length;
-      if (matchingAnchors < 2) {
-        warning = warning
-          ? `${warning} Also: ${pageCount} pages were grouped for this student, but the Student ID was detected only once.`
-          : `${pageCount} pages were grouped for this student, but the Student ID was detected only once -- review for a missed student boundary.`;
-      }
-    }
+  for (const group of grouped) {
+    const groupUnits = group.units;
+    const first = groupUnits[0];
+    const studentId = first.studentId;
+    const sourcePageRanges = groupUnits.map((u) => ({ pageStart: u.pageStart, pageEnd: u.pageEnd }));
 
     const outDoc = await PDFDocument.create();
-    const pageIndices = [];
-    for (let page = pageStart; page <= pageEnd; page++) pageIndices.push(page - 1);
+    const pageIndices: number[] = [];
+    for (const unit of groupUnits) {
+      for (let page = unit.pageStart; page <= unit.pageEnd; page++) pageIndices.push(page - 1);
+    }
     const copied = await outDoc.copyPages(srcDocForCopy, pageIndices);
     copied.forEach((pg) => outDoc.addPage(pg));
     const pdfBytes = await outDoc.save();
 
+    const warning = groupUnits.map((u) => u.warning).filter(Boolean).join(' ') || undefined;
+    const pagesDisagree = groupUnits.some((u) => u.pagesDisagree);
+    const confidence = Math.min(...groupUnits.map((u) => u.confidence));
+    const method = groupUnits.reduce<DetectionMethod>(
+      (best, u) => (u.confidence >= first.confidence ? u.method : best),
+      first.method
+    );
+
     let status: SplitRow['status'];
     if (!studentId) status = 'no-id';
-    else if (warning) status = 'needs-review';
-    else if (method === 'pdf-text-label' && confidence >= AUTO_READY_THRESHOLD) status = 'ready';
+    else if (warning || pagesDisagree) status = 'needs-review';
+    else if (groupUnits.every((u) => u.method === 'pdf-text-label' && u.confidence >= AUTO_READY_THRESHOLD)) status = 'ready';
     else status = 'needs-review';
 
     rows.push({
       id: crypto.randomUUID(),
-      pageStart,
-      pageEnd,
+      pageStart: sourcePageRanges[0].pageStart,
+      pageEnd: sourcePageRanges[sourcePageRanges.length - 1].pageEnd,
+      sourcePageRanges,
       studentId,
       newFilename: studentId ? buildFilenameForProfile(profile, studentId) : '',
       method,
