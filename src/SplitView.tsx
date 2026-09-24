@@ -206,14 +206,13 @@ export default function SplitView({
         <>
           <div className="toolbar">
             <span className="source-note">
-              {sourceName} — {totalPages} pages, split into {rows.length} student unit{rows.length === 1 ? '' : 's'} of{' '}
-              {profile.pagesPerStudent} page{profile.pagesPerStudent === 1 ? '' : 's'} each
+              {sourceName} — {totalPages} pages, grouped into {rows.length} student unit{rows.length === 1 ? '' : 's'}
             </span>
           </div>
           {oddPageWarning && (
             <div className="toolbar-note toolbar-note-block">
-              ⚠ Total page count ({totalPages}) isn't evenly divisible by {profile.pagesPerStudent}. The last unit may be
-              short a page — check it before downloading.
+              ⚠ Total page count ({totalPages}) isn't evenly divisible by the normal {profile.pagesPerStudent}-page unit.
+              Review any flagged unit before downloading.
             </div>
           )}
 
@@ -305,8 +304,9 @@ export default function SplitView({
 
       {rows.length === 0 && !processing && (
         <p className="empty-hint">
-          Upload one merged PDF containing multiple students' letters back-to-back. It'll be split into one PDF per
-          student, {profile.pagesPerStudent} pages each, and renamed the same way as the single-file tool.
+          Upload one merged PDF containing multiple students' letters back-to-back. Student boundaries are detected by
+          Student ID and each student is exported as one PDF. Consecutive pages carrying the same ID stay together, so a
+          translated PNL can remain bundled with the student's English PNL.
         </p>
       )}
 
