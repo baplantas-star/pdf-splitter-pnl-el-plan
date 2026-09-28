@@ -389,20 +389,24 @@ export function detectStudentId(items: TextItem[], pageWidth: number): Detection
   const scored: { id: string; score: number }[] = [];
 
   for (const line of lines) {
-    // Strip underscores/dots/dashes before hunting for digit runs -- some
-    // real PNL templates carry an identifier stamp formatted like
-    // "_6_5_6_2_5_1________" (a fill-in-the-blank line with a digit between
-    // each underscore), unrelated to any "Student ID" label on the page.
-    // Matching \d{4,10} against the raw text finds nothing, because every
-    // digit there is isolated by an underscore; stripping filler characters
-    // first (as bestDigitRun already does for Method 1) collapses it back
-    // to a contiguous, matchable run. Confirmed against a real 20-language
-    // test batch, where this was the entire cause of an intermittent
-    // "No ID found" pattern -- some units happened to succeed via Method 1
-    // (which already stripped filler), the rest silently failed here.
-    const strippedLineText = stripFiller(line.text);
-    const lineDigits = strippedLineText.match(/\d{4,10}/g);
-    if (!lineDigits) continue;
+    // Search token-by-token instead of stripping whitespace from the whole
+    // line. Whole-line whitespace removal can manufacture a false ID from
+    // unrelated table cells on the same row -- e.g. the Portuguese PNL
+    // proficiency scale extracts as four separate cells "1  2  3  4"; the
+    // old code collapsed that row to "1234" and treated it as a Student ID.
+    //
+    // We still remove filler characters *within each token* so genuine
+    // fill-in-the-blank identifiers such as "_6_5_6_2_5_1________" continue
+    // to normalize to "656251". This preserves the useful fallback without
+    // ever joining digits that were separated into distinct PDF text cells.
+    const lineDigits: string[] = [];
+    for (const token of line.text.split(/\s+/).filter(Boolean)) {
+      if (looksLikeDateShape(token)) continue;
+      const cleaned = token.replace(/[_.\-•]/g, '');
+      const runs = cleaned.match(/\d{4,10}/g);
+      if (runs) lineDigits.push(...runs);
+    }
+    if (lineDigits.length === 0) continue;
     for (const d of lineDigits) {
       if (looksLikeExcludedValue(d, line.text)) continue;
       candidates.push(d);
