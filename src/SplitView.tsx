@@ -43,6 +43,7 @@ export default function SplitView({
   const [sourceName, setSourceName] = useState('');
   const [oddPageWarning, setOddPageWarning] = useState(false);
   const [totalPages, setTotalPages] = useState(0);
+  const [ignoredBlankPages, setIgnoredBlankPages] = useState<number[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragActive, setDragActive] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -88,6 +89,7 @@ export default function SplitView({
         setRows(markDuplicates(result.rows));
         setTotalPages(result.totalPages);
         setOddPageWarning(result.oddPageCountWarning);
+        setIgnoredBlankPages(result.ignoredBlankPages);
       } catch (e: any) {
         // Anything that throws past this point -- a page-copy failure in
         // pdf-lib, an out-of-memory error, a corrupt structure loadPdf's
@@ -146,6 +148,7 @@ export default function SplitView({
     setSourceName('');
     setTotalPages(0);
     setOddPageWarning(false);
+    setIgnoredBlankPages([]);
     setLoadError(null);
     terminateOcrWorker();
   }, []);
@@ -206,13 +209,25 @@ export default function SplitView({
         <>
           <div className="toolbar">
             <span className="source-note">
-              {sourceName} — {totalPages} pages, grouped into {rows.length} student unit{rows.length === 1 ? '' : 's'}
+              {sourceName} — {totalPages} pages
+              {ignoredBlankPages.length > 0
+                ? `, ${ignoredBlankPages.length} blank trailing page${ignoredBlankPages.length === 1 ? '' : 's'} ignored`
+                : ''}
+              , grouped into {rows.length} student unit{rows.length === 1 ? '' : 's'}
             </span>
           </div>
+          {ignoredBlankPages.length > 0 && (
+            <div className="toolbar-note toolbar-note-block">
+              {ignoredBlankPages.length} blank trailing page{ignoredBlankPages.length === 1 ? '' : 's'} ignored
+              {ignoredBlankPages.length <= 3
+                ? ` (page${ignoredBlankPages.length === 1 ? '' : 's'} ${ignoredBlankPages.join(', ')})`
+                : ''}. No student file was excluded for these blank pages.
+            </div>
+          )}
           {oddPageWarning && (
             <div className="toolbar-note toolbar-note-block">
-              ⚠ Total page count ({totalPages}) isn't evenly divisible by the normal {profile.pagesPerStudent}-page unit.
-              Review any flagged unit before downloading.
+              ⚠ After ignoring any blank trailing pages, the remaining page count ({totalPages - ignoredBlankPages.length})
+              isn't evenly divisible by the normal {profile.pagesPerStudent}-page unit. Review any flagged unit before downloading.
             </div>
           )}
 
