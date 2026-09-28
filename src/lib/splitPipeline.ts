@@ -13,6 +13,7 @@ export interface SplitBatchResult {
   totalPages: number;
   pagesPerStudent: number;
   oddPageCountWarning: boolean;
+  ignoredBlankPages: number[];
 }
 
 type PageDetection = {
@@ -31,6 +32,46 @@ type Unit = {
   warning?: string;
   pagesDisagree: boolean;
 };
+
+async function isEffectivelyBlankPage(doc: any, pageNumber: number): Promise<boolean> {
+  // Be deliberately conservative: a page is blank only when it has no
+  // extractable non-whitespace text AND a low-resolution render is almost
+  // entirely white. If rendering fails, keep the page rather than risk
+  // discarding real student content.
+  const { items } = await extractPageText(doc, pageNumber);
+  const textChars = items.reduce(
+    (sum: number, item: any) => sum + item.str.replace(/\s/g, '').length,
+    0
+  );
+  if (textChars > 0) return false;
+
+  try {
+    const canvas = await renderPageToCanvas(doc, pageNumber, 0.75);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return false;
+
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    let sampled = 0;
+    let nonWhite = 0;
+
+    // Sample every fourth pixel. This is enough to catch text/marks while
+    // keeping the check cheap even on large pages.
+    const pixelStep = 4;
+    const byteStep = 4 * pixelStep;
+    for (let i = 0; i < data.length; i += byteStep) {
+      sampled++;
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      const a = data[i + 3];
+      if (a > 0 && (r < 245 || g < 245 || b < 245)) nonWhite++;
+    }
+
+    return sampled > 0 && nonWhite / sampled < 0.001;
+  } catch {
+    return false;
+  }
+}
 
 function cropTop(src: HTMLCanvasElement, frac: number): HTMLCanvasElement {
   const sh = src.height * frac;
@@ -149,18 +190,32 @@ export async function splitBatchPdf(file: File, profile: DocumentProfile): Promi
       totalPages: 0,
       pagesPerStudent,
       oddPageCountWarning: false,
+      ignoredBlankPages: [],
     };
   }
 
   const totalPages = loaded.numPages;
-  const oddPageCountWarning = totalPages % pagesPerStudent !== 0;
   const srcDocForCopy = await PDFDocument.load(bytes.slice(0));
+
+  // Some exported batches contain one or more completely blank trailing
+  // pages. Those are not student units and should not create a false
+  // "no ID found" row. Only trailing pages are ignored; blank pages in the
+  // middle of a batch are preserved because removing them could shift unit
+  // boundaries and pair the wrong pages together.
+  const ignoredBlankPages: number[] = [];
+  let effectiveTotalPages = totalPages;
+  while (effectiveTotalPages > 0 && await isEffectivelyBlankPage(loaded.doc, effectiveTotalPages)) {
+    ignoredBlankPages.unshift(effectiveTotalPages);
+    effectiveTotalPages--;
+  }
+
+  const oddPageCountWarning = effectiveTotalPages % pagesPerStudent !== 0;
 
   // Step 1: preserve the known document structure. Each PNL is a normal
   // fixed-size unit; translations are separate units later in the batch.
   const units: Unit[] = [];
-  for (let pageStart = 1; pageStart <= totalPages; pageStart += pagesPerStudent) {
-    const pageEnd = Math.min(pageStart + pagesPerStudent - 1, totalPages);
+  for (let pageStart = 1; pageStart <= effectiveTotalPages; pageStart += pagesPerStudent) {
+    const pageEnd = Math.min(pageStart + pagesPerStudent - 1, effectiveTotalPages);
     const detections: PageDetection[] = [];
     for (let page = pageStart; page <= pageEnd; page++) {
       detections.push(await detectOnPage(loaded.doc, page));
@@ -233,5 +288,5 @@ export async function splitBatchPdf(file: File, profile: DocumentProfile): Promi
     });
   }
 
-  return { rows, totalPages, pagesPerStudent, oddPageCountWarning };
+  return { rows, totalPages, pagesPerStudent, oddPageCountWarning, ignoredBlankPages };
 }
