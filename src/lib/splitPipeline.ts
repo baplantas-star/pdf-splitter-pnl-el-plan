@@ -24,6 +24,7 @@ type PageDetection = {
 };
 
 type Unit = {
+  pageNumbers: number[];
   pageStart: number;
   pageEnd: number;
   studentId: string;
@@ -113,11 +114,12 @@ async function detectOnPage(doc: any, pageNumber: number): Promise<PageDetection
 }
 
 function summarizeUnit(
-  pageStart: number,
-  pageEnd: number,
+  pageNumbers: number[],
   detections: PageDetection[],
   expectedPages: number
 ): Unit {
+  const pageStart = pageNumbers[0];
+  const pageEnd = pageNumbers[pageNumbers.length - 1];
   const withId = detections.filter((d) => d.studentId);
   const distinctIds = [...new Set(withId.map((d) => d.studentId))];
 
@@ -141,14 +143,35 @@ function summarizeUnit(
     pagesDisagree = true;
   }
 
-  const pageCount = pageEnd - pageStart + 1;
+  const pageCount = pageNumbers.length;
   if (pageCount < expectedPages) {
     warning = warning
       ? `${warning} Also: only ${pageCount} page(s) remained, expected ${expectedPages}.`
       : `Only ${pageCount} page(s) remained here, expected ${expectedPages} -- batch page count may be off.`;
   }
 
-  return { pageStart, pageEnd, studentId, method, confidence, warning, pagesDisagree };
+  return { pageNumbers, pageStart, pageEnd, studentId, method, confidence, warning, pagesDisagree };
+}
+
+function collapsePageRanges(pageNumbers: number[]): Array<{ pageStart: number; pageEnd: number }> {
+  if (pageNumbers.length === 0) return [];
+  const sorted = [...pageNumbers].sort((a, b) => a - b);
+  const ranges: Array<{ pageStart: number; pageEnd: number }> = [];
+  let start = sorted[0];
+  let end = sorted[0];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const page = sorted[i];
+    if (page === end + 1) {
+      end = page;
+    } else {
+      ranges.push({ pageStart: start, pageEnd: end });
+      start = page;
+      end = page;
+    }
+  }
+  ranges.push({ pageStart: start, pageEnd: end });
+  return ranges;
 }
 
 /**
@@ -197,30 +220,31 @@ export async function splitBatchPdf(file: File, profile: DocumentProfile): Promi
   const totalPages = loaded.numPages;
   const srcDocForCopy = await PDFDocument.load(bytes.slice(0));
 
-  // Some exported batches contain one or more completely blank trailing
-  // pages. Those are not student units and should not create a false
-  // "no ID found" row. Only trailing pages are ignored; blank pages in the
-  // middle of a batch are preserved because removing them could shift unit
-  // boundaries and pair the wrong pages together.
+  // Some exported batches insert completely blank separator pages between
+  // students (and may also include blank trailing pages). These pages are
+  // not part of any student's PNL and must be removed before fixed-size
+  // units are formed; otherwise every page after the first separator shifts
+  // out of alignment and translations can be attached to the wrong student.
   const ignoredBlankPages: number[] = [];
-  let effectiveTotalPages = totalPages;
-  while (effectiveTotalPages > 0 && await isEffectivelyBlankPage(loaded.doc, effectiveTotalPages)) {
-    ignoredBlankPages.unshift(effectiveTotalPages);
-    effectiveTotalPages--;
+  const contentPages: number[] = [];
+  for (let page = 1; page <= totalPages; page++) {
+    if (await isEffectivelyBlankPage(loaded.doc, page)) ignoredBlankPages.push(page);
+    else contentPages.push(page);
   }
 
-  const oddPageCountWarning = effectiveTotalPages % pagesPerStudent !== 0;
+  const oddPageCountWarning = contentPages.length % pagesPerStudent !== 0;
 
-  // Step 1: preserve the known document structure. Each PNL is a normal
-  // fixed-size unit; translations are separate units later in the batch.
+  // Step 1: form normal fixed-size PNL units from nonblank source pages.
+  // Keep the original page numbers so previews and exported PDFs still map
+  // exactly to the source document.
   const units: Unit[] = [];
-  for (let pageStart = 1; pageStart <= effectiveTotalPages; pageStart += pagesPerStudent) {
-    const pageEnd = Math.min(pageStart + pagesPerStudent - 1, effectiveTotalPages);
+  for (let i = 0; i < contentPages.length; i += pagesPerStudent) {
+    const pageNumbers = contentPages.slice(i, i + pagesPerStudent);
     const detections: PageDetection[] = [];
-    for (let page = pageStart; page <= pageEnd; page++) {
+    for (const page of pageNumbers) {
       detections.push(await detectOnPage(loaded.doc, page));
     }
-    units.push(summarizeUnit(pageStart, pageEnd, detections, pagesPerStudent));
+    units.push(summarizeUnit(pageNumbers, detections, pagesPerStudent));
   }
 
   // Step 2: group only cleanly identified units by Student ID, regardless
@@ -247,13 +271,11 @@ export async function splitBatchPdf(file: File, profile: DocumentProfile): Promi
     const groupUnits = group.units;
     const first = groupUnits[0];
     const studentId = first.studentId;
-    const sourcePageRanges = groupUnits.map((u) => ({ pageStart: u.pageStart, pageEnd: u.pageEnd }));
+    const sourcePageNumbers = groupUnits.flatMap((u) => u.pageNumbers);
+    const sourcePageRanges = collapsePageRanges(sourcePageNumbers);
 
     const outDoc = await PDFDocument.create();
-    const pageIndices: number[] = [];
-    for (const unit of groupUnits) {
-      for (let page = unit.pageStart; page <= unit.pageEnd; page++) pageIndices.push(page - 1);
-    }
+    const pageIndices = sourcePageNumbers.map((page) => page - 1);
     const copied = await outDoc.copyPages(srcDocForCopy, pageIndices);
     copied.forEach((pg) => outDoc.addPage(pg));
     const pdfBytes = await outDoc.save();
