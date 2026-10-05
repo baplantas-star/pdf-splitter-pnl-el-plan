@@ -211,14 +211,14 @@ export default function SplitView({
             <span className="source-note">
               {sourceName} — {totalPages} pages
               {ignoredBlankPages.length > 0
-                ? `, ${ignoredBlankPages.length} blank trailing page${ignoredBlankPages.length === 1 ? '' : 's'} ignored`
+                ? `, ${ignoredBlankPages.length} blank separator page${ignoredBlankPages.length === 1 ? '' : 's'} ignored`
                 : ''}
               , grouped into {rows.length} student unit{rows.length === 1 ? '' : 's'}
             </span>
           </div>
           {ignoredBlankPages.length > 0 && (
             <div className="toolbar-note toolbar-note-block">
-              {ignoredBlankPages.length} blank trailing page{ignoredBlankPages.length === 1 ? '' : 's'} ignored
+              {ignoredBlankPages.length} blank separator page{ignoredBlankPages.length === 1 ? '' : 's'} ignored
               {ignoredBlankPages.length <= 3
                 ? ` (page${ignoredBlankPages.length === 1 ? '' : 's'} ${ignoredBlankPages.join(', ')})`
                 : ''}. No student file was excluded for these blank pages.
@@ -226,7 +226,7 @@ export default function SplitView({
           )}
           {oddPageWarning && (
             <div className="toolbar-note toolbar-note-block">
-              ⚠ After ignoring any blank trailing pages, the remaining page count ({totalPages - ignoredBlankPages.length})
+              ⚠ After ignoring blank separator pages, the remaining page count ({totalPages - ignoredBlankPages.length})
               isn't evenly divisible by the normal {profile.pagesPerStudent}-page unit. Review any flagged unit before downloading.
             </div>
           )}
